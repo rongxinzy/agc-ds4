@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_gpu.h"
 #include "ds4_help.h"
 #include "linenoise.h"
 
@@ -1541,6 +1542,55 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_CUDA;
 #else
         } else if (!strcmp(arg, "--cuda")) {
+            c.engine.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--cuda-devices")) {
+            const char *val = need_arg(&i, argc, argv, arg);
+            if (!strcmp(val, "all")) {
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+                int ndev = ds4_gpu_device_count();
+                if (ndev <= 0) {
+                    fprintf(stderr, "ds4: --cuda-devices all: no CUDA devices found\n");
+                    exit(2);
+                }
+                if (ndev > 8) ndev = 8;
+                c.engine.cuda_device_count = ndev;
+                for (int d = 0; d < ndev; d++) c.engine.cuda_devices[d] = d;
+#else
+                fprintf(stderr, "ds4: --cuda-devices is only supported with the CUDA backend\n");
+                exit(2);
+#endif
+            } else {
+                int count = 0;
+                const char *p = val;
+                while (*p) {
+                    if (count >= 8) {
+                        fprintf(stderr, "ds4: --cuda-devices supports at most 8 devices\n");
+                        exit(2);
+                    }
+                    char *end = NULL;
+                    long v = strtol(p, &end, 10);
+                    if (p == end || v < 0 || v > 7) {
+                        fprintf(stderr, "ds4: invalid --cuda-devices value: %s\n", val);
+                        exit(2);
+                    }
+                    c.engine.cuda_devices[count++] = (int)v;
+                    p = end;
+                    if (*p == ',') p++;
+                    else if (*p != '\0') {
+                        fprintf(stderr, "ds4: invalid --cuda-devices value: %s\n", val);
+                        exit(2);
+                    }
+                }
+                if (count == 0) {
+                    fprintf(stderr, "ds4: --cuda-devices requires a device list\n");
+                    exit(2);
+                }
+                c.engine.cuda_device_count = count;
+            }
+            if (c.engine.backend == DS4_BACKEND_METAL) {
+                fprintf(stderr, "ds4: --cuda-devices cannot be used with --metal\n");
+                exit(2);
+            }
             c.engine.backend = DS4_BACKEND_CUDA;
 #endif
         } else if (!strcmp(arg, "--dump-tokens")) {

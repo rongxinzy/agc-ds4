@@ -20,13 +20,19 @@ extern "C" {
 typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 
 int ds4_gpu_init(void);
+int ds4_gpu_init_multi(const int *devices, int n);
 void ds4_gpu_cleanup(void);
+int ds4_gpu_set_device(int device);
+int ds4_gpu_get_device(void);
+int ds4_gpu_device_count(void);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_on_device(uint64_t bytes, int device);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
+int ds4_gpu_tensor_device(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
@@ -34,6 +40,9 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
+int ds4_gpu_tensor_copy_peer(ds4_gpu_tensor *dst, int dst_device, uint64_t dst_offset,
+                             const ds4_gpu_tensor *src, int src_device, uint64_t src_offset,
+                             uint64_t bytes);
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);

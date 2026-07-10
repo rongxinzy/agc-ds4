@@ -118,6 +118,8 @@ typedef struct {
     uint32_t load_layer_end;
     bool load_output;
     ds4_distributed_options distributed;
+    int cuda_device_count;
+    int cuda_devices[8];
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
