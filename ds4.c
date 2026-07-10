@@ -26686,9 +26686,12 @@ static int ds4_session_eval_layer_slice_impl(ds4_session *s,
                                              uint32_t layer_end,
                                              const float *input_hc,
                                              const ds4_gpu_tensor *input_hc_tensor,
+                                             bool input_hc_tensor_ready,
                                              float *output_hc,
                                              bool output_logits,
                                              float *logits,
+                                             bool async_handoff,
+                                             ds4_gpu_event *handoff_event,
                                              char *err,
                                              size_t errlen) {
     if (!s || !s->engine) {
@@ -26834,7 +26837,7 @@ static int ds4_session_eval_layer_slice_impl(ds4_session *s,
         }
         if (input_hc) {
             ok = ds4_gpu_tensor_write(g->cur_hc, 0, input_hc, hc_dim * sizeof(float)) != 0;
-        } else if (input_hc_tensor) {
+        } else if (input_hc_tensor && !input_hc_tensor_ready) {
             ok = ds4_gpu_tensor_copy_peer(g->cur_hc,
                                           ds4_gpu_tensor_device(g->cur_hc),
                                           0,
@@ -26915,9 +26918,22 @@ static int ds4_session_eval_layer_slice_impl(ds4_session *s,
             if (ok && output_logits) {
                 ok = metal_graph_encode_output_head(g, &e->model, &e->weights, e->weights.output->dim[1]);
             }
-            if (ok) ok = ds4_gpu_end_commands() != 0;
+            if (ok) {
+                if (async_handoff && !output_logits && !output_hc) {
+                    /* Handoff to next device: record an event on the default stream
+                     * instead of blocking the host. */
+                } else {
+                    ok = ds4_gpu_end_commands() != 0;
+                }
+            }
         }
-        if (ok && !output_hc && !output_logits) ok = ds4_gpu_synchronize() != 0;
+        if (ok && !output_hc && !output_logits) {
+            if (async_handoff && handoff_event) {
+                ok = ds4_gpu_event_record(handoff_event) != 0;
+            } else {
+                ok = ds4_gpu_synchronize() != 0;
+            }
+        }
         if (ok && output_hc) {
             ok = ds4_gpu_tensor_read(g->cur_hc, 0, output_hc, hc_dim * sizeof(float)) != 0;
         }
@@ -26952,7 +26968,7 @@ static int ds4_session_eval_layer_slice_impl(ds4_session *s,
     if (ok) ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, &span, 0, n_tokens);
     if (ok && input_hc) {
         ok = ds4_gpu_tensor_write(g->batch_cur_hc, 0, input_hc, hc_bytes) != 0;
-    } else if (ok && input_hc_tensor) {
+    } else if (ok && input_hc_tensor && !input_hc_tensor_ready) {
         ok = ds4_gpu_tensor_copy_peer(g->batch_cur_hc,
                                       ds4_gpu_tensor_device(g->batch_cur_hc),
                                       0,
@@ -27061,9 +27077,10 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                  size_t errlen) {
     return ds4_session_eval_layer_slice_impl(s, tokens, n_tokens, pos0,
                                              layer_start, layer_end,
-                                             input_hc, NULL,
+                                             input_hc, NULL, false,
                                              output_hc, output_logits,
-                                             logits, err, errlen);
+                                             logits, false, NULL,
+                                             err, errlen);
 }
 
 #ifndef DS4_NO_GPU
@@ -27091,9 +27108,12 @@ static int ds4_session_sync_multi_pipeline(
                                               e->multi_layer_end[i],
                                               NULL,
                                               src_hc,
+                                              false,
                                               NULL,
                                               sub_output_logits,
                                               sub_logits,
+                                              false,
+                                              NULL,
                                               err,
                                               errlen) != 0) {
             return 1;
@@ -27589,33 +27609,131 @@ static int ds4_session_eval_multi(ds4_session *s, int token,
                                   char *err, size_t errlen) {
     ds4_engine *e = s->engine;
     const uint32_t pos0 = (uint32_t)s->checkpoint.len;
-    const ds4_gpu_tensor *src_hc = NULL;
+
+    /* Keep the simple synchronous pipeline for non-CUDA backends and single-device. */
+    if (e->backend != DS4_BACKEND_CUDA || e->multi_count <= 1) {
+        const ds4_gpu_tensor *src_hc = NULL;
+        for (int i = 0; i < e->multi_count; i++) {
+            ds4_gpu_set_device(e->multi_devices[i]);
+            ds4_session *sub = (i == 0) ? s : s->multi_sessions[i];
+            const bool output_logits = (i == e->multi_count - 1);
+            if (ds4_session_eval_layer_slice_impl(sub,
+                                                  &token,
+                                                  1,
+                                                  pos0,
+                                                  e->multi_layer_start[i],
+                                                  e->multi_layer_end[i],
+                                                  NULL,
+                                                  src_hc,
+                                                  false,
+                                                  NULL,
+                                                  output_logits,
+                                                  output_logits ? s->logits : NULL,
+                                                  false,
+                                                  NULL,
+                                                  err,
+                                                  errlen) != 0) {
+                s->checkpoint_valid = false;
+                return 1;
+            }
+            src_hc = sub->graph.cur_hc;
+        }
+        return 0;
+    }
+
+    /* CUDA: event-driven pipeline without per-device cudaDeviceSynchronize.
+     * Each stage records a compute-completion event; the next stage waits on
+     * a peer-copy-completion event before running. */
+    ds4_gpu_event **compute_events = (ds4_gpu_event **)calloc((size_t)e->multi_count, sizeof(*compute_events));
+    ds4_gpu_event **copy_events    = (ds4_gpu_event **)calloc((size_t)e->multi_count, sizeof(*copy_events));
+    if (!compute_events || !copy_events) {
+        free(compute_events);
+        free(copy_events);
+        s->checkpoint_valid = false;
+        if (errlen) snprintf(err, errlen, "out of memory for multi-gpu events");
+        return 1;
+    }
+
+    for (int i = 0; i < e->multi_count - 1; i++) {
+        compute_events[i] = ds4_gpu_event_create(e->multi_devices[i]);
+        if (!compute_events[i]) goto event_fail;
+    }
+    for (int i = 1; i < e->multi_count; i++) {
+        copy_events[i] = ds4_gpu_event_create(e->multi_devices[i - 1]);
+        if (!copy_events[i]) goto event_fail;
+    }
+
     for (int i = 0; i < e->multi_count; i++) {
         ds4_gpu_set_device(e->multi_devices[i]);
         ds4_session *sub = (i == 0) ? s : s->multi_sessions[i];
-        const uint32_t layer_start = e->multi_layer_start[i];
-        const uint32_t layer_end = e->multi_layer_end[i];
         const bool output_logits = (i == e->multi_count - 1);
-        float *logits_out = output_logits ? s->logits : NULL;
+        ds4_gpu_event *copy_complete = (i > 0) ? copy_events[i] : NULL;
+        ds4_gpu_event *compute_ready = (i < e->multi_count - 1) ? compute_events[i] : NULL;
+
+        if (copy_complete && !ds4_gpu_event_wait_on_current(copy_complete)) {
+            fprintf(stderr, "ds4: multi-gpu wait on copy event failed for device %d\n", e->multi_devices[i]);
+            goto eval_fail;
+        }
+
         if (ds4_session_eval_layer_slice_impl(sub,
                                               &token,
                                               1,
                                               pos0,
-                                              layer_start,
-                                              layer_end,
+                                              e->multi_layer_start[i],
+                                              e->multi_layer_end[i],
                                               NULL,
-                                              src_hc,
+                                              (i > 0) ? sub->graph.cur_hc : NULL,
+                                              (i > 0),
                                               NULL,
                                               output_logits,
-                                              logits_out,
+                                              output_logits ? s->logits : NULL,
+                                              !output_logits,
+                                              compute_ready,
                                               err,
                                               errlen) != 0) {
-            s->checkpoint_valid = false;
-            return 1;
+            goto eval_fail;
         }
-        src_hc = sub->graph.cur_hc;
+
+        if (compute_ready) {
+            ds4_session *next_sub = s->multi_sessions[i + 1];
+            if (!ds4_gpu_tensor_copy_peer_async(next_sub->graph.cur_hc,
+                                                ds4_gpu_tensor_device(next_sub->graph.cur_hc),
+                                                0,
+                                                sub->graph.cur_hc,
+                                                ds4_gpu_tensor_device(sub->graph.cur_hc),
+                                                0,
+                                                (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float),
+                                                compute_ready,
+                                                copy_events[i + 1])) {
+                if (errlen) snprintf(err, errlen, "multi-gpu async handoff from device %d failed",
+                                     e->multi_devices[i]);
+                goto eval_fail;
+            }
+        }
     }
+
+    for (int i = 0; i < e->multi_count; i++) {
+        ds4_gpu_event_free(compute_events[i]);
+        ds4_gpu_event_free(copy_events[i]);
+    }
+    free(compute_events);
+    free(copy_events);
     return 0;
+
+eval_fail:
+    for (int i = 0; i < e->multi_count; i++) {
+        ds4_gpu_set_device(e->multi_devices[i]);
+        (void)ds4_gpu_synchronize();
+    }
+event_fail:
+    for (int i = 0; i < e->multi_count; i++) {
+        ds4_gpu_event_free(compute_events[i]);
+        ds4_gpu_event_free(copy_events[i]);
+    }
+    free(compute_events);
+    free(copy_events);
+    s->checkpoint_valid = false;
+    return 1;
 }
 #endif
 

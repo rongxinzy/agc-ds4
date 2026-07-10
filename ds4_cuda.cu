@@ -183,6 +183,7 @@ struct cuda_device_state {
     int model_mapping_failure_notice_printed;
     cudaStream_t model_prefetch_stream;
     cudaStream_t model_upload_stream;
+    cudaStream_t peer_stream;
     cublasHandle_t cublas;
     int cublas_ready;
     int quality_mode;
@@ -2394,6 +2395,7 @@ extern "C" int ds4_gpu_init(void) {
         (void)cublasSetMathMode(g_cublas, math_mode);
         g_cublas_ready = 1;
     }
+    if (!cuda_ok(cudaStreamCreate(&g_cuda_devices[dev].peer_stream), "create peer stream")) return 0;
     return 1;
 }
 
@@ -2430,6 +2432,7 @@ extern "C" int ds4_gpu_init_multi(const int *devices, int n) {
             (void)cublasSetMathMode(g_cublas, math_mode);
             g_cublas_ready = 1;
         }
+        if (!cuda_ok(cudaStreamCreate(&g_cuda_devices[dev].peer_stream), "create peer stream")) return 0;
     }
 
     g_cuda_device_count = n;
@@ -2514,6 +2517,10 @@ extern "C" void ds4_gpu_cleanup(void) {
         if (g_model_prefetch_stream) {
             (void)cudaStreamDestroy(g_model_prefetch_stream);
             g_model_prefetch_stream = NULL;
+        }
+        if (g_cuda_devices[d].peer_stream) {
+            (void)cudaStreamDestroy(g_cuda_devices[d].peer_stream);
+            g_cuda_devices[d].peer_stream = NULL;
         }
     }
 
@@ -2745,6 +2752,124 @@ extern "C" int ds4_gpu_tensor_copy_peer(ds4_gpu_tensor *dst, int dst_device, uin
     err = cudaMemcpy((char *)dst->ptr + dst_offset, stage, (size_t)bytes, cudaMemcpyHostToDevice);
     (void)cudaFreeHost(stage);
     return cuda_ok(err, "tensor copy peer fallback");
+}
+
+/* Opaque event wrapping a CUDA event recorded on a specific device. */
+struct ds4_gpu_event {
+    cudaEvent_t event;
+    int device;
+};
+
+extern "C" ds4_gpu_event *ds4_gpu_event_create(int device) {
+    ds4_gpu_event *ev = (ds4_gpu_event *)calloc(1, sizeof(*ev));
+    if (!ev) return NULL;
+    ev->device = device;
+    int original;
+    (void)cudaGetDevice(&original);
+    if (!cuda_ok(cudaSetDevice(device), "event create set device")) {
+        free(ev);
+        return NULL;
+    }
+    cudaError_t err = cudaEventCreate(&ev->event);
+    (void)cudaSetDevice(original);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        free(ev);
+        return NULL;
+    }
+    return ev;
+}
+
+extern "C" void ds4_gpu_event_free(ds4_gpu_event *ev) {
+    if (!ev) return;
+    (void)cudaEventDestroy(ev->event);
+    free(ev);
+}
+
+extern "C" int ds4_gpu_event_record(ds4_gpu_event *ev) {
+    if (!ev) return 0;
+    int original;
+    (void)cudaGetDevice(&original);
+    if (!cuda_ok(cudaSetDevice(ev->device), "event record set device")) return 0;
+    int ret = cuda_ok(cudaEventRecord(ev->event, 0), "event record");
+    (void)cudaSetDevice(original);
+    return ret;
+}
+
+extern "C" int ds4_gpu_event_wait_on_current(ds4_gpu_event *ev) {
+    if (!ev) return 1;
+    return cuda_ok(cudaStreamWaitEvent(0, ev->event, 0), "event wait on current");
+}
+
+extern "C" int ds4_gpu_event_synchronize(ds4_gpu_event *ev) {
+    if (!ev) return 1;
+    return cuda_ok(cudaEventSynchronize(ev->event), "event synchronize");
+}
+
+extern "C" int ds4_gpu_tensor_copy_peer_async(ds4_gpu_tensor *dst, int dst_device, uint64_t dst_offset,
+                                              const ds4_gpu_tensor *src, int src_device, uint64_t src_offset,
+                                              uint64_t bytes,
+                                              ds4_gpu_event *wait_event,
+                                              ds4_gpu_event *complete_event) {
+    if (!dst || !src || dst_offset > dst->bytes || src_offset > src->bytes ||
+        bytes > dst->bytes - dst_offset || bytes > src->bytes - src_offset) {
+        return 0;
+    }
+    if (bytes == 0) return 1;
+    if (dst_device < 0) dst_device = dst->device;
+    if (src_device < 0) src_device = src->device;
+
+    /* Same-device: use the ordinary async device copy on the peer stream. */
+    if (dst_device == src_device) {
+        if (!cuda_set_current_device(src_device)) return 0;
+        cudaStream_t stream = g_cuda_devices[src_device].peer_stream;
+        if (wait_event && wait_event->device == src_device) {
+            if (!cuda_ok(cudaStreamWaitEvent(stream, wait_event->event, 0), "peer async same-device wait")) return 0;
+        } else if (wait_event) {
+            /* Cross-device event on the default stream is sufficient for ordering. */
+            if (!cuda_ok(cudaStreamWaitEvent(0, wait_event->event, 0), "peer async wait on default")) return 0;
+        }
+        int ret = cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
+                                          (const char *)src->ptr + src_offset,
+                                          (size_t)bytes, cudaMemcpyDeviceToDevice, stream),
+                          "tensor copy peer async same-device");
+        if (ret && complete_event) {
+            (void)cudaEventRecord(complete_event->event, stream);
+        }
+        return ret;
+    }
+
+    int can_peer = 0;
+    (void)cudaDeviceCanAccessPeer(&can_peer, src_device, dst_device);
+    if (!can_peer) {
+        /* No P2P: serialize on the producer and use the synchronous copy path,
+         * then record completion for the consumer. */
+        if (wait_event && !ds4_gpu_event_synchronize(wait_event)) return 0;
+        if (!ds4_gpu_tensor_copy_peer(dst, dst_device, dst_offset,
+                                      src, src_device, src_offset, bytes)) {
+            return 0;
+        }
+        if (complete_event) {
+            if (!cuda_set_current_device(dst_device)) return 0;
+            return cuda_ok(cudaEventRecord(complete_event->event, 0), "copy peer async fallback complete");
+        }
+        return 1;
+    }
+
+    /* P2P async copy on the source device's peer stream. */
+    if (!cuda_set_current_device(src_device)) return 0;
+    cudaStream_t stream = g_cuda_devices[src_device].peer_stream;
+    if (wait_event) {
+        if (!cuda_ok(cudaStreamWaitEvent(stream, wait_event->event, 0), "peer async wait")) return 0;
+    }
+    int ret = cuda_ok(cudaMemcpyPeerAsync((char *)dst->ptr + dst_offset, dst_device,
+                                          (const char *)src->ptr + src_offset, src_device,
+                                          (size_t)bytes, stream),
+                      "tensor copy peer async");
+    if (ret && complete_event) {
+        (void)cudaEventRecord(complete_event->event, stream);
+    }
+    return ret;
 }
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
