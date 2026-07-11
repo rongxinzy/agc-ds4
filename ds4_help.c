@@ -153,6 +153,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
 #else
     opt(fp, c, "--metal | --cuda | --cpu", "Select the backend explicitly.");
     opt(fp, c, "--backend NAME", "Backend name: metal, cuda, or cpu.");
+    opt(fp, c, "--cuda-devices 0,1,... | all", "CUDA layer-parallel device list (max 8).");
 #endif
     if (tool != DS4_HELP_BENCH) {
         opt(fp, c, "-c, --ctx N", "Allocated context tokens.");

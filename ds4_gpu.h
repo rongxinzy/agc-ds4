@@ -18,15 +18,22 @@ extern "C" {
  * buffers stay device-owned across the whole prefill/decode command sequence.
  */
 typedef struct ds4_gpu_tensor ds4_gpu_tensor;
+typedef struct ds4_gpu_event ds4_gpu_event;
 
 int ds4_gpu_init(void);
+int ds4_gpu_init_multi(const int *devices, int n);
 void ds4_gpu_cleanup(void);
+int ds4_gpu_set_device(int device);
+int ds4_gpu_get_device(void);
+int ds4_gpu_device_count(void);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_on_device(uint64_t bytes, int device);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
+int ds4_gpu_tensor_device(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
@@ -34,6 +41,28 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
+int ds4_gpu_tensor_copy_peer(ds4_gpu_tensor *dst, int dst_device, uint64_t dst_offset,
+                             const ds4_gpu_tensor *src, int src_device, uint64_t src_offset,
+                             uint64_t bytes);
+
+/* Asynchronous cross-device copy using a per-device peer stream.  wait_event
+ * must have been recorded on the producer stream before the copy; if non-NULL
+ * the peer stream waits on it before copying.  complete_event, if non-NULL, is
+ * recorded on the peer stream after the copy completes. */
+int ds4_gpu_tensor_copy_peer_async(ds4_gpu_tensor *dst, int dst_device, uint64_t dst_offset,
+                                   const ds4_gpu_tensor *src, int src_device, uint64_t src_offset,
+                                   uint64_t bytes,
+                                   ds4_gpu_event *wait_event,
+                                   ds4_gpu_event *complete_event);
+
+ds4_gpu_event *ds4_gpu_event_create(int device);
+void ds4_gpu_event_free(ds4_gpu_event *ev);
+/* Record on the current device's default stream. */
+int ds4_gpu_event_record(ds4_gpu_event *ev);
+/* Make the current device's default stream wait for ev. */
+int ds4_gpu_event_wait_on_current(ds4_gpu_event *ev);
+int ds4_gpu_event_synchronize(ds4_gpu_event *ev);
+
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);
