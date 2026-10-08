@@ -21828,6 +21828,16 @@ struct ds4_engine {
     bool ssd_streaming;
     bool ssd_streaming_cold;
     ds4_distributed_options distributed;
+    bool is_multi;
+    int multi_count;
+    int multi_devices[8];
+    uint32_t multi_layer_start[8];
+    uint32_t multi_layer_end[8];
+    struct ds4_engine *multi_engines[8];
+    bool model_owned;
+    bool vocab_owned;
+    bool gpu_owned;
+    bool lock_owned;
     bool metal_ready;
     bool mtp_ready;
 };
@@ -23280,6 +23290,9 @@ struct ds4_session {
     int ctx_size;
     bool checkpoint_valid;
     bool mtp_draft_valid;
+    bool is_multi;
+    int multi_count;
+    ds4_session *multi_sessions[8];
 };
 
 /* =========================================================================
@@ -25543,10 +25556,22 @@ static bool ds4_engine_preload_pro_q4_expert_tables(
 #endif
 }
 
+static int ds4_engine_open_on_device(ds4_engine **out,
+                                     const ds4_engine_options *opt,
+                                     ds4_engine *parent,
+                                     int device,
+                                     uint32_t layer_start,
+                                     uint32_t layer_end,
+                                     bool load_output);
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->mtp_model.fd = -1;
+    e->model_owned = true;
+    e->vocab_owned = true;
+    e->gpu_owned = true;
+    e->lock_owned = true;
     e->backend = opt->backend;
     e->quality = opt->quality;
     e->ssd_streaming = opt->ssd_streaming;
@@ -25607,6 +25632,38 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (opt->warm_weights) model_warm_weights(&e->model);
     if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
+
+    if (opt->cuda_device_count > 1) {
+        if (e->backend != DS4_BACKEND_CUDA) {
+            fprintf(stderr, "ds4: --cuda-devices is only supported with the CUDA backend\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (opt->cuda_device_count > 8) {
+            fprintf(stderr, "ds4: --cuda-devices supports at most 8 devices\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        e->is_multi = true;
+        e->multi_count = opt->cuda_device_count;
+        for (int i = 0; i < e->multi_count; i++) e->multi_devices[i] = opt->cuda_devices[i];
+        const uint32_t n_layer = DS4_N_LAYER;
+        const uint32_t layers_per_dev = (n_layer + (uint32_t)e->multi_count - 1u) / (uint32_t)e->multi_count;
+        for (int i = 0; i < e->multi_count; i++) {
+            uint32_t start = (uint32_t)i * layers_per_dev;
+            uint32_t end = start + layers_per_dev - 1u;
+            if (end >= n_layer || i == e->multi_count - 1) end = n_layer - 1u;
+            e->multi_layer_start[i] = start;
+            e->multi_layer_end[i] = end;
+        }
+        load_slice = true;
+        load_layer_start = e->multi_layer_start[0];
+        load_layer_end = e->multi_layer_end[0];
+        load_output = e->multi_count == 1;
+    }
+
     if (e->ssd_streaming && !ds4_backend_supports_ssd_streaming(e->backend)) {
         fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --metal/--cuda/--rocm\n");
         ds4_engine_close(e);
@@ -25713,7 +25770,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 #endif
     }
     if (graph_backend) {
-        e->metal_ready = ds4_gpu_init() != 0;
+        if (e->backend == DS4_BACKEND_CUDA && opt->cuda_device_count > 1) {
+            e->metal_ready = ds4_gpu_init_multi(opt->cuda_devices, opt->cuda_device_count) != 0;
+        } else {
+            e->metal_ready = ds4_gpu_init() != 0;
+        }
         if (!e->metal_ready) {
             fprintf(stderr, "ds4: %s backend unavailable; aborting startup\n",
                     ds4_backend_name(e->backend));
@@ -25970,6 +26031,25 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
 #endif
 
+    if (e->is_multi) {
+        for (int i = 1; i < e->multi_count; i++) {
+            ds4_engine *sub = NULL;
+            const bool sub_load_output = (i == e->multi_count - 1);
+            if (ds4_engine_open_on_device(&sub,
+                                          opt,
+                                          e,
+                                          e->multi_devices[i],
+                                          e->multi_layer_start[i],
+                                          e->multi_layer_end[i],
+                                          sub_load_output) != 0) {
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            e->multi_engines[i] = sub;
+        }
+    }
+
     *out = e;
     return 0;
 }
@@ -26020,20 +26100,269 @@ int ds4_engine_model_id(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
-    ds4_expert_profile_close();
+    if (e->is_multi) {
+        for (int i = 1; i < e->multi_count; i++) {
+            ds4_engine_close(e->multi_engines[i]);
+            e->multi_engines[i] = NULL;
+        }
+    }
+    if (e->model_owned) ds4_expert_profile_close();
     weights_free(&e->weights);
-    vocab_free(&e->vocab);
-    ds4_threads_shutdown();
+    if (e->vocab_owned) vocab_free(&e->vocab);
+    if (e->lock_owned) ds4_threads_shutdown();
     if (e->mtp_ready) model_close(&e->mtp_model);
-    model_close(&e->model);
+    if (e->model_owned) model_close(&e->model);
 #ifndef DS4_NO_GPU
-    ds4_gpu_cleanup();
+    if (e->gpu_owned) ds4_gpu_cleanup();
 #endif
-    ds4_ssd_memory_lock_release(&e->simulated_memory);
-    ds4_release_instance_lock();
+    if (e->lock_owned) {
+        ds4_ssd_memory_lock_release(&e->simulated_memory);
+        ds4_release_instance_lock();
+    }
     free(e->directional_steering_dirs);
     free(e->directional_steering_file);
     free(e);
+}
+
+static int ds4_engine_open_on_device(ds4_engine **out,
+                                     const ds4_engine_options *opt,
+                                     ds4_engine *parent,
+                                     int device,
+                                     uint32_t layer_start,
+                                     uint32_t layer_end,
+                                     bool load_output) {
+    ds4_engine *e = xcalloc(1, sizeof(*e));
+    e->model = parent->model;
+    e->vocab = parent->vocab;
+    e->model.fd = -1;
+    e->mtp_model.fd = -1;
+    e->model_owned = false;
+    e->vocab_owned = false;
+    e->gpu_owned = false;
+    e->lock_owned = false;
+    e->backend = opt->backend;
+    e->quality = opt->quality;
+    e->ssd_streaming = opt->ssd_streaming;
+    e->ssd_streaming_cold = opt->ssd_streaming_cold;
+    e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
+    e->prefill_chunk = opt->prefill_chunk;
+    e->ssd_streaming_cache_experts = opt->ssd_streaming_cache_experts;
+    e->ssd_streaming_cache_bytes = opt->ssd_streaming_cache_bytes;
+    e->ssd_streaming_preload_experts = opt->ssd_streaming_preload_experts;
+    if (e->power_percent > 100) e->power_percent = 100;
+    e->mtp_draft_tokens = 1;
+    e->mtp_margin = 3.0f;
+    if (opt->directional_steering_file && opt->directional_steering_file[0]) {
+        e->directional_steering_file = ds4_strdup(opt->directional_steering_file);
+        e->directional_steering_attn_scale = opt->directional_steering_attn;
+        e->directional_steering_ffn_scale = opt->directional_steering_ffn;
+    }
+
+    weights_bind(&e->weights,
+                 &e->model,
+                 true,
+                 layer_start,
+                 layer_end,
+                 load_output,
+                 false);
+
+    if (e->ssd_streaming && e->ssd_streaming_cache_bytes != 0) {
+        const uint64_t requested_cache_bytes = e->ssd_streaming_cache_bytes;
+        const uint64_t safe_cache_bytes = ds4_streaming_manual_cache_safe_bytes();
+        if (safe_cache_bytes != 0 && e->ssd_streaming_cache_bytes > safe_cache_bytes) {
+            e->ssd_streaming_cache_bytes = safe_cache_bytes;
+            fprintf(stderr,
+                    "ds4: %s SSD streaming cache budget %.2f GiB capped to %.2f GiB "
+                    "to keep expert buffers lockable\n",
+                    ds4_backend_name(e->backend),
+                    (double)requested_cache_bytes / 1073741824.0,
+                    (double)e->ssd_streaming_cache_bytes / 1073741824.0);
+        }
+        uint64_t per_expert_bytes = 0;
+        const uint32_t budget =
+            ds4_streaming_cache_experts_for_byte_budget(
+                    &e->weights,
+                    e->ssd_streaming_cache_bytes,
+                    &per_expert_bytes);
+        if (budget == 0 || per_expert_bytes == 0) {
+            fprintf(stderr,
+                    "ds4: --ssd-streaming-cache-experts byte budget is too small or invalid for this model\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        e->ssd_streaming_cache_experts = budget;
+        fprintf(stderr,
+                "ds4: %s SSD streaming cache budget %.2f GiB / %.2f MiB per expert = %u experts\n",
+                ds4_backend_name(e->backend),
+                (double)e->ssd_streaming_cache_bytes / 1073741824.0,
+                (double)per_expert_bytes / 1048576.0,
+                budget);
+    }
+
+#ifndef DS4_NO_GPU
+    ds4_gpu_set_device(device);
+    ds4_gpu_set_quality(e->quality);
+    ds4_gpu_set_ssd_streaming(e->ssd_streaming);
+    if (!ds4_engine_configure_streaming_auto_cache(e)) {
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
+    ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
+    if (e->ssd_streaming) {
+        uint64_t slab_expert_bytes = 0;
+        if (ds4_streaming_routed_expert_bytes(&e->weights, &slab_expert_bytes)) {
+            ds4_gpu_set_streaming_expert_cache_expert_bytes(slab_expert_bytes);
+            uint32_t routed = 0, boosted = 0;
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                const ds4_layer_weights *l = &e->weights.layer[il];
+                if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) continue;
+                routed++;
+                if (!weights_streaming_layer_experts_uniform(&e->weights, il)) boosted++;
+            }
+            if (boosted > 0) {
+                fprintf(stderr,
+                        "ds4: SSD streaming mixed-precision model: %u/%u routed layers "
+                        "off the slab size class will bypass the expert cache and read "
+                        "experts via mapped model views\n",
+                        boosted, routed);
+            }
+            if (boosted * 2 > routed) {
+                fprintf(stderr,
+                        "ds4: WARNING: the majority of routed layers (%u/%u) are off the "
+                        "slab size class (is the FIRST routed layer itself boosted?); "
+                        "expert-cache hit rate will be catastrophic\n",
+                        boosted, routed);
+            }
+        }
+    }
+    (void)ds4_gpu_set_model_fd(e->model.fd);
+    int model_map_ok = 0;
+    uint64_t *load_offsets = NULL;
+    uint64_t *load_sizes = NULL;
+    uint32_t load_span_count = 0;
+    if (e->ssd_streaming) {
+        ds4_model_map_span_vec spans;
+        bool spans_ok = weights_model_map_decode_static_slice_spans(
+                &e->weights,
+                layer_start,
+                layer_end,
+                true,
+                load_output,
+                &spans);
+        if (!spans_ok) {
+            fprintf(stderr, "ds4: invalid SSD streaming initial slice map\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        uint64_t *offsets = xmalloc((size_t)spans.len * sizeof(offsets[0]));
+        uint64_t *sizes = xmalloc((size_t)spans.len * sizeof(sizes[0]));
+        uint64_t span_bytes = 0;
+        for (uint32_t i = 0; i < spans.len; i++) {
+            offsets[i] = spans.v[i].off;
+            sizes[i] = spans.v[i].end - spans.v[i].off;
+            span_bytes += sizes[i];
+        }
+        load_offsets = offsets;
+        load_sizes = sizes;
+        load_span_count = spans.len;
+        fprintf(stderr,
+                "ds4: SSD streaming initial %s model map restricted to slice %u:%u+output (%u spans, %.2f GiB tensor span)\n",
+                ds4_backend_name(e->backend),
+                layer_start,
+                layer_end,
+                spans.len,
+                (double)span_bytes / 1073741824.0);
+        model_map_ok = ds4_gpu_set_model_map_spans(e->model.map,
+                                                    e->model.size,
+                                                    load_offsets,
+                                                    load_sizes,
+                                                    load_span_count,
+                                                    spans.max_tensor_bytes);
+        free(spans.v);
+    } else {
+        ds4_model_map_span_vec spans;
+        if (!weights_model_map_spans(&e->weights,
+                                     layer_start,
+                                     layer_end,
+                                     load_output,
+                                     &spans)) {
+            fprintf(stderr, "ds4: invalid model load layer slice %u:%u\n",
+                    layer_start, layer_end);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        uint64_t *offsets = xmalloc((size_t)spans.len * sizeof(offsets[0]));
+        uint64_t *sizes = xmalloc((size_t)spans.len * sizeof(sizes[0]));
+        uint64_t span_bytes = 0;
+        for (uint32_t i = 0; i < spans.len; i++) {
+            offsets[i] = spans.v[i].off;
+            sizes[i] = spans.v[i].end - spans.v[i].off;
+            span_bytes += sizes[i];
+        }
+        load_offsets = offsets;
+        load_sizes = sizes;
+        load_span_count = spans.len;
+        fprintf(stderr,
+                "ds4: restricting %s model map to layers %u:%u (%u spans, %.2f GiB tensor span)\n",
+                ds4_backend_name(e->backend),
+                layer_start,
+                layer_end,
+                spans.len,
+                (double)span_bytes / 1073741824.0);
+        model_map_ok = ds4_gpu_set_model_map_spans(e->model.map,
+                                                    e->model.size,
+                                                    load_offsets,
+                                                    load_sizes,
+                                                    load_span_count,
+                                                    spans.max_tensor_bytes);
+        free(spans.v);
+    }
+    if (!model_map_ok) {
+        fprintf(stderr,
+                "ds4: %s failed to map model views for device %d; aborting startup.\n",
+                ds4_backend_name(e->backend), device);
+        free(load_offsets);
+        free(load_sizes);
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
+    if (!ds4_engine_preload_pro_q4_expert_tables(e, true, layer_start, layer_end)) {
+        free(load_offsets);
+        free(load_sizes);
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
+    (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+    if (!accelerator_cache_model_tensors(e->backend, &e->model,
+                                         load_offsets, load_sizes,
+                                         load_span_count)) {
+        fprintf(stderr, "ds4: %s failed to prepare optional model cache for device %d\n",
+                ds4_backend_name(e->backend), device);
+        free(load_offsets);
+        free(load_sizes);
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
+    free(load_offsets);
+    free(load_sizes);
+    fprintf(stderr, "ds4: %s backend initialized for device %d\n",
+            ds4_backend_name(e->backend), device);
+#else
+    (void)device;
+    (void)layer_start;
+    (void)layer_end;
+    (void)load_output;
+#endif
+    e->metal_ready = true;
+    *out = e;
+    return 0;
 }
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
@@ -26064,6 +26393,11 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->ctx_size = ctx_size;
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size,
                                                         e->prefill_chunk);
+#ifndef DS4_NO_GPU
+    if (e->is_multi) {
+        ds4_gpu_set_device(e->multi_devices[0]);
+    }
+#endif
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
     const ds4_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
     if (!shape_layer) {
@@ -26114,6 +26448,33 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             return 1;
         }
     }
+    if (e->is_multi) {
+        s->is_multi = true;
+        s->multi_count = e->multi_count;
+        for (int i = 1; i < e->multi_count; i++) {
+#ifndef DS4_NO_GPU
+            ds4_gpu_set_device(e->multi_devices[i]);
+#endif
+            ds4_session *sub = NULL;
+            if (ds4_session_create(&sub, e->multi_engines[i], ctx_size) != 0) {
+                fprintf(stderr, "ds4: failed to create session for device %d\n", e->multi_devices[i]);
+                for (int j = 1; j < i; j++) {
+                    ds4_session_free(s->multi_sessions[j]);
+                    s->multi_sessions[j] = NULL;
+                }
+                metal_graph_free(&s->graph);
+                free(s->logits);
+                free(s->mtp_logits);
+                free(s);
+                return 1;
+            }
+            s->multi_sessions[i] = sub;
+        }
+#ifndef DS4_NO_GPU
+        ds4_gpu_set_device(e->multi_devices[0]);
+#endif
+    }
+
     *out = s;
     return 0;
 #endif
@@ -26121,6 +26482,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
+    if (s->is_multi) {
+        for (int i = 1; i < s->multi_count; i++) {
+            ds4_session_free(s->multi_sessions[i]);
+            s->multi_sessions[i] = NULL;
+        }
+    }
     ds4_dist_session_free(s->distributed);
     if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
@@ -26311,18 +26678,22 @@ static DS4_MAYBE_UNUSED void ds4_session_slice_commit_timeline(ds4_session *s, c
     s->mtp_draft_valid = false;
 }
 
-int ds4_session_eval_layer_slice(ds4_session *s,
-                                 const int *tokens,
-                                 uint32_t n_tokens,
-                                 uint32_t pos0,
-                                 uint32_t layer_start,
-                                 uint32_t layer_end,
-                                 const float *input_hc,
-                                 float *output_hc,
-                                 bool output_logits,
-                                 float *logits,
-                                 char *err,
-                                 size_t errlen) {
+static int ds4_session_eval_layer_slice_impl(ds4_session *s,
+                                             const int *tokens,
+                                             uint32_t n_tokens,
+                                             uint32_t pos0,
+                                             uint32_t layer_start,
+                                             uint32_t layer_end,
+                                             const float *input_hc,
+                                             const ds4_gpu_tensor *input_hc_tensor,
+                                             bool input_hc_tensor_ready,
+                                             float *output_hc,
+                                             bool output_logits,
+                                             float *logits,
+                                             bool async_handoff,
+                                             ds4_gpu_event *handoff_event,
+                                             char *err,
+                                             size_t errlen) {
     if (!s || !s->engine) {
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
         return 1;
@@ -26332,9 +26703,13 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                              layer_start, layer_end);
         return 1;
     }
-    if (layer_start != 0 && !input_hc) {
+    if (layer_start != 0 && !input_hc && !input_hc_tensor) {
         if (errlen) snprintf(err, errlen, "layer-slice layer %u requires input hidden-state",
                              layer_start);
+        return 1;
+    }
+    if (input_hc && input_hc_tensor) {
+        if (errlen) snprintf(err, errlen, "layer-slice cannot use both host and tensor hidden-state");
         return 1;
     }
     if (output_logits && layer_end + 1u != (uint32_t)DS4_N_LAYER) {
@@ -26350,7 +26725,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                              layer_start, layer_end);
         return 1;
     }
-    if (!input_hc && !s->engine->weights.token_embd) {
+    if (!input_hc && !input_hc_tensor && !s->engine->weights.token_embd) {
         if (errlen) snprintf(err, errlen, "token embedding is not loaded");
         return 1;
     }
@@ -26456,15 +26831,23 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         }
 
         bool ok = true;
-        if (g->ssd_streaming && !input_hc) {
+        if (g->ssd_streaming && !input_hc && !input_hc_tensor) {
             g->streaming_static_decode_map_current = false;
             ok = metal_graph_stream_map_token(&e->model, &e->weights);
         }
         if (input_hc) {
             ok = ds4_gpu_tensor_write(g->cur_hc, 0, input_hc, hc_dim * sizeof(float)) != 0;
+        } else if (input_hc_tensor && !input_hc_tensor_ready) {
+            ok = ds4_gpu_tensor_copy_peer(g->cur_hc,
+                                          ds4_gpu_tensor_device(g->cur_hc),
+                                          0,
+                                          input_hc_tensor,
+                                          ds4_gpu_tensor_device(input_hc_tensor),
+                                          0,
+                                          hc_dim * sizeof(float)) != 0;
         }
         if (ok) ok = ds4_gpu_begin_commands() != 0;
-        if (ok && !input_hc) {
+        if (ok && !input_hc && !input_hc_tensor) {
             ok = ds4_gpu_embed_token_hc_tensor(g->cur_hc,
                                                e->model.map,
                                                e->model.size,
@@ -26535,9 +26918,22 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             if (ok && output_logits) {
                 ok = metal_graph_encode_output_head(g, &e->model, &e->weights, e->weights.output->dim[1]);
             }
-            if (ok) ok = ds4_gpu_end_commands() != 0;
+            if (ok) {
+                if (async_handoff && !output_logits && !output_hc) {
+                    /* Handoff to next device: record an event on the default stream
+                     * instead of blocking the host. */
+                } else {
+                    ok = ds4_gpu_end_commands() != 0;
+                }
+            }
         }
-        if (ok && !output_hc && !output_logits) ok = ds4_gpu_synchronize() != 0;
+        if (ok && !output_hc && !output_logits) {
+            if (async_handoff && handoff_event) {
+                ok = ds4_gpu_event_record(handoff_event) != 0;
+            } else {
+                ok = ds4_gpu_synchronize() != 0;
+            }
+        }
         if (ok && output_hc) {
             ok = ds4_gpu_tensor_read(g->cur_hc, 0, output_hc, hc_dim * sizeof(float)) != 0;
         }
@@ -26565,13 +26961,21 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     };
 
     bool ok = true;
-    if (g->ssd_streaming && !input_hc) {
+    if (g->ssd_streaming && !input_hc && !input_hc_tensor) {
         g->streaming_static_decode_map_current = false;
         ok = metal_graph_stream_map_token(&e->model, &e->weights);
     }
     if (ok) ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, &span, 0, n_tokens);
     if (ok && input_hc) {
         ok = ds4_gpu_tensor_write(g->batch_cur_hc, 0, input_hc, hc_bytes) != 0;
+    } else if (ok && input_hc_tensor && !input_hc_tensor_ready) {
+        ok = ds4_gpu_tensor_copy_peer(g->batch_cur_hc,
+                                      ds4_gpu_tensor_device(g->batch_cur_hc),
+                                      0,
+                                      input_hc_tensor,
+                                      ds4_gpu_tensor_device(input_hc_tensor),
+                                      0,
+                                      hc_bytes) != 0;
     } else if (ok) {
         ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
                                                      g->prefill_tokens,
@@ -26658,6 +27062,137 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     return 0;
 #endif
 }
+
+int ds4_session_eval_layer_slice(ds4_session *s,
+                                 const int *tokens,
+                                 uint32_t n_tokens,
+                                 uint32_t pos0,
+                                 uint32_t layer_start,
+                                 uint32_t layer_end,
+                                 const float *input_hc,
+                                 float *output_hc,
+                                 bool output_logits,
+                                 float *logits,
+                                 char *err,
+                                 size_t errlen) {
+    return ds4_session_eval_layer_slice_impl(s, tokens, n_tokens, pos0,
+                                             layer_start, layer_end,
+                                             input_hc, NULL, false,
+                                             output_hc, output_logits,
+                                             logits, false, NULL,
+                                             err, errlen);
+}
+
+#ifndef DS4_NO_GPU
+static int ds4_session_sync_multi_pipeline(
+        ds4_session *s,
+        const int   *tokens,
+        uint32_t     n_tokens,
+        uint32_t     pos0,
+        bool         output_logits,
+        float       *logits,
+        char        *err,
+        size_t       errlen) {
+    ds4_engine *e = s->engine;
+    const ds4_gpu_tensor *src_hc = NULL;
+    for (int i = 0; i < e->multi_count; i++) {
+        ds4_gpu_set_device(e->multi_devices[i]);
+        ds4_session *sub = (i == 0) ? s : s->multi_sessions[i];
+        const bool sub_output_logits = output_logits && (i == e->multi_count - 1);
+        float *sub_logits = sub_output_logits ? logits : NULL;
+        if (ds4_session_eval_layer_slice_impl(sub,
+                                              tokens,
+                                              n_tokens,
+                                              pos0,
+                                              e->multi_layer_start[i],
+                                              e->multi_layer_end[i],
+                                              NULL,
+                                              src_hc,
+                                              false,
+                                              NULL,
+                                              sub_output_logits,
+                                              sub_logits,
+                                              false,
+                                              NULL,
+                                              err,
+                                              errlen) != 0) {
+            return 1;
+        }
+        src_hc = (n_tokens == 1) ? sub->graph.cur_hc : sub->graph.batch_cur_hc;
+    }
+    return 0;
+}
+
+static int ds4_session_sync_multi(ds4_session *s,
+                                  const ds4_tokens *prompt,
+                                  char *err,
+                                  size_t errlen) {
+    ds4_engine *e = s->engine;
+    bool need_reset = true;
+    uint32_t pos0 = 0;
+    if (s->checkpoint_valid &&
+        prompt->len >= s->checkpoint.len &&
+        ds4_tokens_starts_with(prompt, &s->checkpoint))
+    {
+        need_reset = false;
+        pos0 = (uint32_t)s->checkpoint.len;
+    }
+
+    if (need_reset) {
+        for (int i = 0; i < e->multi_count; i++) {
+            ds4_session *sub = (i == 0) ? s : s->multi_sessions[i];
+            if (ds4_session_layer_slice_reset(sub, err, errlen) != 0) {
+                s->checkpoint_valid = false;
+                return 1;
+            }
+        }
+        s->checkpoint.len = 0;
+        s->checkpoint_valid = false;
+        s->mtp_draft_valid = false;
+        pos0 = 0;
+    }
+
+    const uint32_t total = (uint32_t)prompt->len;
+    if (pos0 >= total) {
+        s->checkpoint_valid = true;
+        return 0;
+    }
+
+    const uint32_t chunk_cap = s->prefill_cap > 0 ? s->prefill_cap : (uint32_t)prompt->len;
+    uint32_t cursor = pos0;
+    while (cursor < total) {
+        if (ds4_session_cancelled(s)) {
+            snprintf(err, errlen, "interrupted");
+            s->checkpoint_valid = cursor > pos0;
+            s->mtp_draft_valid = false;
+            return DS4_SESSION_SYNC_INTERRUPTED;
+        }
+        const uint32_t chunk = (cursor + chunk_cap <= total) ? chunk_cap : (total - cursor);
+        const bool last_chunk = (cursor + chunk == total);
+        float *chunk_logits = last_chunk ? s->logits : NULL;
+        if (ds4_session_sync_multi_pipeline(s,
+                                            prompt->v + cursor,
+                                            chunk,
+                                            cursor,
+                                            last_chunk,
+                                            chunk_logits,
+                                            err,
+                                            errlen) != 0) {
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        cursor += chunk;
+        if (s->progress) {
+            s->progress(s->progress_ud, "prefill_chunk", (int)cursor, prompt->len);
+        }
+    }
+
+    ds4_tokens_copy(&s->checkpoint, prompt);
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    return 0;
+}
+#endif
 
 #ifndef DS4_NO_GPU
 typedef struct {
@@ -26768,6 +27303,13 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
 #else
     ds4_engine *e = s->engine;
     const char *backend_name = ds4_backend_name(e->backend);
+
+#ifndef DS4_NO_GPU
+    if (s->is_multi) {
+        (void)backend_name;
+        return ds4_session_sync_multi(s, prompt, err, errlen);
+    }
+#endif
 
     if (s->checkpoint_valid &&
         prompt->len >= s->checkpoint.len &&
@@ -27062,6 +27604,139 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
     return 0;
 }
 
+#ifndef DS4_NO_GPU
+static int ds4_session_eval_multi(ds4_session *s, int token,
+                                  char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+    const uint32_t pos0 = (uint32_t)s->checkpoint.len;
+
+    /* Keep the simple synchronous pipeline for non-CUDA backends and single-device. */
+    if (e->backend != DS4_BACKEND_CUDA || e->multi_count <= 1) {
+        const ds4_gpu_tensor *src_hc = NULL;
+        for (int i = 0; i < e->multi_count; i++) {
+            ds4_gpu_set_device(e->multi_devices[i]);
+            ds4_session *sub = (i == 0) ? s : s->multi_sessions[i];
+            const bool output_logits = (i == e->multi_count - 1);
+            if (ds4_session_eval_layer_slice_impl(sub,
+                                                  &token,
+                                                  1,
+                                                  pos0,
+                                                  e->multi_layer_start[i],
+                                                  e->multi_layer_end[i],
+                                                  NULL,
+                                                  src_hc,
+                                                  false,
+                                                  NULL,
+                                                  output_logits,
+                                                  output_logits ? s->logits : NULL,
+                                                  false,
+                                                  NULL,
+                                                  err,
+                                                  errlen) != 0) {
+                s->checkpoint_valid = false;
+                return 1;
+            }
+            src_hc = sub->graph.cur_hc;
+        }
+        return 0;
+    }
+
+    /* CUDA: event-driven pipeline without per-device cudaDeviceSynchronize.
+     * Each stage records a compute-completion event; the next stage waits on
+     * a peer-copy-completion event before running. */
+    ds4_gpu_event **compute_events = (ds4_gpu_event **)calloc((size_t)e->multi_count, sizeof(*compute_events));
+    ds4_gpu_event **copy_events    = (ds4_gpu_event **)calloc((size_t)e->multi_count, sizeof(*copy_events));
+    if (!compute_events || !copy_events) {
+        free(compute_events);
+        free(copy_events);
+        s->checkpoint_valid = false;
+        if (errlen) snprintf(err, errlen, "out of memory for multi-gpu events");
+        return 1;
+    }
+
+    for (int i = 0; i < e->multi_count - 1; i++) {
+        compute_events[i] = ds4_gpu_event_create(e->multi_devices[i]);
+        if (!compute_events[i]) goto event_fail;
+    }
+    for (int i = 1; i < e->multi_count; i++) {
+        copy_events[i] = ds4_gpu_event_create(e->multi_devices[i - 1]);
+        if (!copy_events[i]) goto event_fail;
+    }
+
+    for (int i = 0; i < e->multi_count; i++) {
+        ds4_gpu_set_device(e->multi_devices[i]);
+        ds4_session *sub = (i == 0) ? s : s->multi_sessions[i];
+        const bool output_logits = (i == e->multi_count - 1);
+        ds4_gpu_event *copy_complete = (i > 0) ? copy_events[i] : NULL;
+        ds4_gpu_event *compute_ready = (i < e->multi_count - 1) ? compute_events[i] : NULL;
+
+        if (copy_complete && !ds4_gpu_event_wait_on_current(copy_complete)) {
+            fprintf(stderr, "ds4: multi-gpu wait on copy event failed for device %d\n", e->multi_devices[i]);
+            goto eval_fail;
+        }
+
+        if (ds4_session_eval_layer_slice_impl(sub,
+                                              &token,
+                                              1,
+                                              pos0,
+                                              e->multi_layer_start[i],
+                                              e->multi_layer_end[i],
+                                              NULL,
+                                              (i > 0) ? sub->graph.cur_hc : NULL,
+                                              (i > 0),
+                                              NULL,
+                                              output_logits,
+                                              output_logits ? s->logits : NULL,
+                                              !output_logits,
+                                              compute_ready,
+                                              err,
+                                              errlen) != 0) {
+            goto eval_fail;
+        }
+
+        if (compute_ready) {
+            ds4_session *next_sub = s->multi_sessions[i + 1];
+            if (!ds4_gpu_tensor_copy_peer_async(next_sub->graph.cur_hc,
+                                                ds4_gpu_tensor_device(next_sub->graph.cur_hc),
+                                                0,
+                                                sub->graph.cur_hc,
+                                                ds4_gpu_tensor_device(sub->graph.cur_hc),
+                                                0,
+                                                (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float),
+                                                compute_ready,
+                                                copy_events[i + 1])) {
+                if (errlen) snprintf(err, errlen, "multi-gpu async handoff from device %d failed",
+                                     e->multi_devices[i]);
+                goto eval_fail;
+            }
+        }
+    }
+
+    for (int i = 0; i < e->multi_count; i++) {
+        ds4_gpu_event_free(compute_events[i]);
+        ds4_gpu_event_free(copy_events[i]);
+    }
+    free(compute_events);
+    free(copy_events);
+    return 0;
+
+eval_fail:
+    for (int i = 0; i < e->multi_count; i++) {
+        ds4_gpu_set_device(e->multi_devices[i]);
+        (void)ds4_gpu_synchronize();
+    }
+event_fail:
+    for (int i = 0; i < e->multi_count; i++) {
+        ds4_gpu_event_free(compute_events[i]);
+        ds4_gpu_event_free(copy_events[i]);
+    }
+    free(compute_events);
+    free(copy_events);
+    s->checkpoint_valid = false;
+    return 1;
+}
+#endif
+
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
@@ -27097,6 +27772,12 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         (void)probe_mtp;
         return 0;
     }
+#ifndef DS4_NO_GPU
+    if (s->is_multi) {
+        (void)probe_mtp;
+        return ds4_session_eval_multi(s, token, err, errlen);
+    }
+#endif
 #ifdef DS4_NO_GPU
     (void)s;
     (void)token;
